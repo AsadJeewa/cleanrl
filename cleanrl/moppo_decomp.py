@@ -12,10 +12,10 @@ import torch.optim as optim
 import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
-
 import mo_gymnasium as mo_gym
 from mo_gymnasium.wrappers import MORecordEpisodeStatistics, SingleRewardWrapper
 from gymnasium.wrappers import TimeLimit
+from cleanrl_utils.utils import get_base_env
 
 @dataclass
 class Args:
@@ -37,7 +37,7 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    env_id: str = "resource-gathering-v0"#"four-room-easy-v0"
+    env_id: str = "four-room-easy-v0"
     """the id of the environment"""
     total_timesteps: int = 1e7#1e5
     """total timesteps of the experiments"""
@@ -245,11 +245,23 @@ if __name__ == "__main__":
     next_obs_list = []
     next_done_list = []
 
-    for envs in envs_list:
-        obs, _ = envs.reset(seed=args.seed)
-        next_obs_list.append(torch.Tensor(obs).to(device))
-        next_done_list.append(torch.zeros(args.num_envs).to(device))
+    for obj_idx, vec_env in enumerate(envs_list):
+        # reset vectorised env
+        obs, _ = vec_env.reset(seed=args.seed)
+        
+        # get specialised obs for each underlying env
+        spec_obs_list = []
+        for env in vec_env.envs:
+            base_env = get_base_env(env)
+            spec_obs = base_env.update_specialisation(obj_idx + 1)  # returns masked obs
+            spec_obs = spec_obs.squeeze(0)  # now [obs_dim]
+            spec_obs_list.append(spec_obs) 
 
+        # Stack all envs into a single batch tensor
+        spec_obs_batch = np.concatenate(spec_obs_list, axis=0)  # merges along first dim
+        next_obs_list.append(torch.Tensor(spec_obs_batch).to(device))
+        next_done_list.append(torch.zeros(args.num_envs, dtype=torch.float32).to(device))
+        
     if args.resume_from:
         checkpoint = torch.load(args.resume_from, map_location=device)
         for agent, state_dict in zip(agents, checkpoint["agents"]):
