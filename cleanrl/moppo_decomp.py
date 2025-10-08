@@ -17,6 +17,7 @@ from mo_gymnasium.wrappers import MORecordEpisodeStatistics, SingleRewardWrapper
 from gymnasium.wrappers import TimeLimit
 from cleanrl_utils.utils import get_base_env
 
+
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
@@ -39,11 +40,11 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "four-room-easy-v0"
     """the id of the environment"""
-    total_timesteps: int = 1e7#1e5
+    total_timesteps: int = 1e7  # 1e5
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 2 #4
+    num_envs: int = 2  # 4
     """the number of parallel game environments"""
     num_steps: int = 1024
     """the number of steps to run in each environment per policy rollout"""
@@ -63,7 +64,7 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.05 #0.01
+    ent_coef: float = 0.05  # 0.01
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
@@ -82,10 +83,11 @@ class Args:
 
     checkpoint_interval: int = 10
     """the checkpoint interval in iterations"""
-    resume_from: str = ""  
+    resume_from: str = ""
     """the relative checkpoint pt to load checkpoint from"""
-    run_name_modifier: str = ""  
+    run_name_modifier: str = ""
     """run name modifier"""
+
 
 def make_env(env_id, obj_idx, capture_video, run_name):
     def thunk():
@@ -200,11 +202,10 @@ if __name__ == "__main__":
 
     agents = [Agent(envs_list[i]).to(device) for i in range(num_objectives)]
 
-    optimizer = optim.Adam(
-        [p for agent in agents for p in agent.parameters()],
-        lr=args.learning_rate,
-        eps=1e-5,
-    )
+    optimizers = [
+        optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+        for agent in agents
+    ]
 
     # ALGO Logic: Storage setup
     # storage: one per agent
@@ -248,48 +249,58 @@ if __name__ == "__main__":
     for obj_idx, vec_env in enumerate(envs_list):
         # reset vectorised env
         obs, _ = vec_env.reset(seed=args.seed)
-        
+
         # get specialised obs for each underlying env
         spec_obs_list = []
         for env in vec_env.envs:
             base_env = get_base_env(env)
             spec_obs = base_env.update_specialisation(obj_idx + 1)  # returns masked obs
             spec_obs = spec_obs.squeeze(0)  # now [obs_dim]
-            spec_obs_list.append(spec_obs) 
+            spec_obs_list.append(spec_obs)
 
         # Stack all envs into a single batch tensor
         spec_obs_batch = np.concatenate(spec_obs_list, axis=0)  # merges along first dim
         next_obs_list.append(torch.Tensor(spec_obs_batch).to(device))
-        next_done_list.append(torch.zeros(args.num_envs, dtype=torch.float32).to(device))
-        
+        next_done_list.append(
+            torch.zeros(args.num_envs, dtype=torch.float32).to(device)
+        )
+
     if args.resume_from:
         checkpoint = torch.load(args.resume_from, map_location=device)
         for agent, state_dict in zip(agents, checkpoint["agents"]):
             agent.load_state_dict(state_dict)
-        optimizer.load_state_dict(checkpoint["optimizer"])
+        for optimizer, state_dict in zip(optimizers, checkpoint["optimizers"]):
+            optimizer.load_state_dict(state_dict)
         start_iteration = checkpoint["iteration"] + 1
         global_step = checkpoint["global_step"]
         print(f"Resumed from {args.resume_from} at iteration {start_iteration}")
     else:
         start_iteration = 1
 
-    for iteration in range(start_iteration, int(args.num_iterations) + 1): #So each iteration is a full cycle of data collection + training.
+    for iteration in range(
+        start_iteration, int(args.num_iterations) + 1
+    ):  # So each iteration is a full cycle of data collection + training.
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
-            optimizer.param_groups[0]["lr"] = lrnow
-
+            for i, opt in enumerate(optimizers):
+                opt.param_groups[0]["lr"] = lrnow
+                
         # max_episode_steps = 500
         # initialize before step loop
-        running_returns = [np.zeros(args.num_envs) for _ in range(num_objectives)] #num_objectives lists of size num_envs
+        running_returns = [
+            np.zeros(args.num_envs) for _ in range(num_objectives)
+        ]  # num_objectives lists of size num_envs
         running_lengths = [np.zeros(args.num_envs) for _ in range(num_objectives)]
 
-        #GENERATING EXPERIENCE
+        # GENERATING EXPERIENCE
         for step in range(0, args.num_steps):
             mean_returns_per_obj = []
             mean_lengths_per_obj = []
-            for i, envs in enumerate(envs_list):#EACH IS A VEC ENV i.e. loop each objective seperately
+            for i, envs in enumerate(
+                envs_list
+            ):  # EACH IS A VEC ENV i.e. loop each objective seperately
                 global_step += args.num_envs
                 agent = agents[i]
                 next_obs = next_obs_list[i]
@@ -316,7 +327,7 @@ if __name__ == "__main__":
 
                 running_returns[i] += reward_batch
                 running_lengths[i] += 1
-    
+
                 finished_mask = np.logical_or(terminations, truncations)
                 # reset running sums for finished envs
                 finished_returns = running_returns[i][finished_mask]
@@ -327,19 +338,34 @@ if __name__ == "__main__":
                 if finished_returns.size > 0:
                     mean_return_per_vec = finished_returns.mean()
                     mean_length_per_vec = finished_lengths.mean()
-                    writer.add_scalar(f"charts/mean_episodic_return_obj{i}", mean_return_per_vec, global_step)
-                    writer.add_scalar(f"charts/mean_episodic_length_obj{i}", mean_length_per_vec, global_step)
+                    writer.add_scalar(
+                        f"charts/mean_episodic_return_obj{i}",
+                        mean_return_per_vec,
+                        global_step,
+                    )
+                    writer.add_scalar(
+                        f"charts/mean_episodic_length_obj{i}",
+                        mean_length_per_vec,
+                        global_step,
+                    )
                     mean_returns_per_obj.append(mean_return_per_vec)
                     mean_lengths_per_obj.append(mean_length_per_vec)
             # compute mean across all objectives
             if len(mean_returns_per_obj) > 0:
                 overall_mean_return = np.mean(mean_returns_per_obj)
                 overall_mean_length = np.mean(mean_lengths_per_obj)
-                writer.add_scalar("charts/mean_episodic_return_all_objs", overall_mean_return, global_step)
-                writer.add_scalar("charts/mean_episodic_length_all_objs", overall_mean_length, global_step)
+                writer.add_scalar(
+                    "charts/mean_episodic_return_all_objs",
+                    overall_mean_return,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "charts/mean_episodic_length_all_objs",
+                    overall_mean_length,
+                    global_step,
+                )
 
-
-        #CALCULATING BEFORE TRAINING
+        # CALCULATING BEFORE TRAINING
         # bootstrap value if not done
         advantages_list = []
         returns_list = []
@@ -386,7 +412,9 @@ if __name__ == "__main__":
 
         # TRAINING
         # flatten the batch
-        for i, agent in enumerate(agents):#TRAIN EACH AGENT ON ITS CORRESPONDING EXPERIENCE
+        for i, agent in enumerate(
+            agents
+        ):  # TRAIN EACH AGENT ON ITS CORRESPONDING EXPERIENCE
             obs = obs_list[i].reshape(
                 (-1,) + envs_list[i].single_observation_space.shape
             )
@@ -454,20 +482,26 @@ if __name__ == "__main__":
                         pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
                     )
 
-                    optimizer.zero_grad()
+                    optimizers[i].zero_grad()
                     loss.backward()
                     nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                    optimizer.step()
+                    optimizers[i].step()
 
                 if args.target_kl is not None and approx_kl > args.target_kl:
                     break
 
             writer.add_scalar(f"losses/value_loss_obj{i}", v_loss.item(), global_step)
             writer.add_scalar(f"losses/policy_loss_obj{i}", pg_loss.item(), global_step)
-            writer.add_scalar(f"losses/entropy_obj{i}", entropy_loss.item(), global_step)
-            writer.add_scalar(f"losses/old_approx_kl_obj{i}", old_approx_kl.item(), global_step)
+            writer.add_scalar(
+                f"losses/entropy_obj{i}", entropy_loss.item(), global_step
+            )
+            writer.add_scalar(
+                f"losses/old_approx_kl_obj{i}", old_approx_kl.item(), global_step
+            )
             writer.add_scalar(f"losses/approx_kl_obj{i}", approx_kl.item(), global_step)
-            writer.add_scalar(f"losses/clipfrac_obj{i}", np.mean(clipfracs), global_step)
+            writer.add_scalar(
+                f"losses/clipfrac_obj{i}", np.mean(clipfracs), global_step
+            )
 
             v_loss_list.append(v_loss.item())
             pg_loss_list.append(pg_loss.item())
@@ -475,7 +509,6 @@ if __name__ == "__main__":
             old_approx_kl_list.append(old_approx_kl.item())
             approx_kl_list.append(approx_kl.item())
             clipfracs_list.append(np.mean(clipfracs))
-
 
             y_pred, y_true = values.cpu().numpy(), returns.cpu().numpy()
             var_y = np.var(y_true)
@@ -485,12 +518,14 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar(
-            "charts/learning_rate", optimizer.param_groups[0]["lr"], global_step
+            "charts/learning_rate", optimizers[obj_idx].param_groups[0]["lr"], global_step
         )
         writer.add_scalar("losses/value_loss", np.mean(v_loss_list), global_step)
         writer.add_scalar("losses/policy_loss", np.mean(pg_loss_list), global_step)
         writer.add_scalar("losses/entropy", np.mean(entropy_loss_list), global_step)
-        writer.add_scalar("losses/old_approx_kl", np.mean(old_approx_kl_list), global_step)
+        writer.add_scalar(
+            "losses/old_approx_kl", np.mean(old_approx_kl_list), global_step
+        )
         writer.add_scalar("losses/approx_kl", np.mean(approx_kl_list), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs_list), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
@@ -501,13 +536,16 @@ if __name__ == "__main__":
 
         if iteration % args.checkpoint_interval == 0:
             checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_{iteration}.pt")
-            torch.save({
-                "iteration": iteration,
-                "global_step": global_step,
-                "agents": [agent.state_dict() for agent in agents],
-                "optimizer": optimizer.state_dict(),
-                "args": vars(args),
-            }, checkpoint_path)
+            torch.save(
+                {
+                    "iteration": iteration,
+                    "global_step": global_step,
+                    "agents": [agent.state_dict() for agent in agents],
+                    "optimizers": [optimizer.state_dict() for optimizer in optimizers],
+                    "args": vars(args),
+                },
+                checkpoint_path,
+            )
             print(f"Saved checkpoint: {checkpoint_path}")
 
     for envs in envs_list:
