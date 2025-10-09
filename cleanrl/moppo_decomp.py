@@ -306,6 +306,9 @@ if __name__ == "__main__":
                 next_obs = next_obs_list[i]
                 next_done = next_done_list[i]
 
+                obs_list[i][step] = next_obs
+                dones_list[i][step] = next_done
+
                 with torch.no_grad():
                     action, logprob, _, value = agent.get_action_and_value(next_obs)
                     values_list[i][step] = value.flatten()
@@ -518,7 +521,7 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar(
-            "charts/learning_rate", optimizers[obj_idx].param_groups[0]["lr"], global_step
+            "charts/learning_rate", optimizers[0].param_groups[0]["lr"], global_step
         )
         writer.add_scalar("losses/value_loss", np.mean(v_loss_list), global_step)
         writer.add_scalar("losses/policy_loss", np.mean(pg_loss_list), global_step)
