@@ -39,7 +39,7 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    env_id: str = "four-room-easy-v0"
+    env_id: str = "shapes-grid-v0"
     """the id of the environment"""
     total_timesteps: int = 1e7#1e5
     """total timesteps of the experiments"""
@@ -195,7 +195,7 @@ if __name__ == "__main__":
     controller = Controller(envs).to(device)
     agents = [Agent(envs).to(device) for i in range(num_objectives)]
 
-    checkpoint_path = "../model/four-room-easy/checkpoint_4880.pt"  # adjust path
+    checkpoint_path = "../model/four-room-easy//fin_moppo_env__four-room-easy-v0__moppo_decomp__1__1760003876/checkpoint_2160.pt"  # adjust path
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     for idx, agent in enumerate(agents):
