@@ -88,10 +88,15 @@ class Args:
     """the relative checkpoint pt to load checkpoint from"""
     run_name_modifier: str = ""  
     """run name modifier"""
+    low_level_checkpoint_path: str = "../model/shapes-grid/larger_grid_low_level__shapes-grid-v0__moppo_decomp__1__1760103414/checkpoint_2440.pt"  
+    """checkpoint path for pre-trained low-level policies"""
 
     obj_duration: int = 5
     """how many primitive steps the chosen low-level policy runs for each high-level decision"""
 
+    offline: bool = True
+    """Toggles whether to log to cloud or store offline"""
+    
 def make_env(env_id, idx, capture_video, run_name):
     def thunk():
         # if capture_video and idx == 0:
@@ -168,6 +173,7 @@ if __name__ == "__main__":
             name=run_name,
             monitor_gym=True,
             save_code=True,
+            mode=args.offline,
         )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -195,9 +201,9 @@ if __name__ == "__main__":
     controller = Controller(envs).to(device)
     agents = [Agent(envs).to(device) for i in range(num_objectives)]
 
-    checkpoint_path = "../model/four-room-easy//fin_moppo_env__four-room-easy-v0__moppo_decomp__1__1760003876/checkpoint_2160.pt"  # adjust path
+    low_level_checkpoint_path = args.low_level_checkpoint_path
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(low_level_checkpoint_path, map_location=device)
     for idx, agent in enumerate(agents):
         agent.load_state_dict(checkpoint["agents"][idx])
     

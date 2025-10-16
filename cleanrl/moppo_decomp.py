@@ -87,6 +87,9 @@ class Args:
     """the relative checkpoint pt to load checkpoint from"""
     run_name_modifier: str = ""
     """run name modifier"""
+    
+    offline: bool = True
+    """Toggles whether to log to cloud or store offline"""
 
 
 def make_env(env_id, obj_idx, capture_video, run_name):
@@ -167,6 +170,7 @@ if __name__ == "__main__":
             name=run_name,
             monitor_gym=True,
             save_code=True,
+            mode=args.offline,
         )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
