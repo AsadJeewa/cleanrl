@@ -93,9 +93,6 @@ class Args:
 
     obj_duration: int = 5
     """how many primitive steps the chosen low-level policy runs for each high-level decision"""
-
-    offline: bool = True
-    """Toggles whether to log to cloud or store offline"""
     
 def make_env(env_id, idx, capture_video, run_name):
     def thunk():
@@ -173,7 +170,6 @@ if __name__ == "__main__":
             name=run_name,
             monitor_gym=True,
             save_code=True,
-            mode=args.offline,
         )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
