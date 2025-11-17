@@ -30,6 +30,8 @@ class Args:
     """if toggled, cuda will be enabled by default"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
+    offline: bool = False
+    """if toggled, this experiment will be tracked OFFLINE with Weights and Biases"""    
     wandb_project_name: str = "cleanRL"
     """the wandb's project name"""
     wandb_entity: str = None
@@ -85,7 +87,7 @@ class Args:
     """the checkpoint interval in iterations"""
     resume_from: str = ""
     """the relative checkpoint pt to load checkpoint from"""
-    run_name_modifier: str = ""
+    run_name_mod: str = ""
     """run name modifier"""
 
 def make_env(env_id, obj_idx, capture_video, run_name):
@@ -151,13 +153,14 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.run_name_modifier}__{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.run_name_mod}__{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     checkpoint_dir = f"checkpoints/{run_name}"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     if args.track:
         import wandb
-
+        if args.offline:
+            os.environ["WANDB_MODE"] = "offline"
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
