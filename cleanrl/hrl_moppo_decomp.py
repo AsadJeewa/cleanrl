@@ -90,11 +90,13 @@ class Args:
     """the relative checkpoint pt to load checkpoint from"""
     run_name_mod: str = ""  
     """run name modifier"""
-    low_level_checkpoint_path: str = "../model/shapes-grid/larger_grid_low_level__shapes-grid-v0__moppo_decomp__1__1760103414/checkpoint_2440.pt"  
+    low_level_checkpoint_path: str = "../model/shapes-grid/toy2_long__shapes-grid-v0__moppo_decomp__1__1763475033/checkpoint_1010.pt"  
     """checkpoint path for pre-trained low-level policies"""
 
-    obj_duration: int = 5
+    obj_duration: int = 2#5
     """how many primitive steps the chosen low-level policy runs for each high-level decision"""
+    use_weights: bool = True
+    """Toggles whether or not to uscondition the ocntroller on weights."""
     
 def make_env(env_id, idx, capture_video, run_name):
     def thunk():
@@ -121,11 +123,14 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
     
 class Controller(nn.Module):
-    def __init__(self, envs):
+    def __init__(self, envs, use_weights=False):
         super().__init__()
+        obs_dim = envs.single_observation_space.shape
+        reward_dim = envs.envs[0].reward_dim
+        input_dim = int(np.prod(obs_dim)) + reward_dim if use_weights else obs_dim
         self.critic = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)
+                nn.Linear(np.array(input_dim).prod(), 64)
             ),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
@@ -134,18 +139,20 @@ class Controller(nn.Module):
         )
         self.actor = nn.Sequential(
             layer_init(
-                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)
+                nn.Linear(np.array(input_dim).prod(), 64)
             ),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, get_base_env(envs.envs[0]).reward_dim), std=0.01),#num objectives
+            layer_init(nn.Linear(64, reward_dim), std=0.01),#num objectives
         )
 
-    def get_value(self, x):
+    def get_value(self, obs, w=None):
+        x = torch.cat([obs, w], dim=1) if w is not None else obs
         return self.critic(x)
 
-    def get_action_and_value(self, x, action=None):
+    def get_action_and_value(self, obs, w=None, action=None):
+        x = torch.cat([obs, w], dim=1) if w is not None else obs
         logits = self.actor(x)
         probs = Categorical(logits=logits)
         if action is None:
@@ -160,7 +167,8 @@ if __name__ == "__main__":
     run_name = f"{args.run_name_mod}__{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     checkpoint_dir = f"checkpoints/{run_name}"
     os.makedirs(checkpoint_dir, exist_ok=True)
-
+    use_weights = args.use_weights
+    
     if args.track:
         import wandb
         if args.offline:
@@ -197,7 +205,7 @@ if __name__ == "__main__":
     num_objectives = get_base_env(envs.envs[0]).reward_dim
 
     base_env = get_base_env(envs.envs[0])
-    controller = Controller(envs).to(device)
+    controller = Controller(envs, use_weights).to(device)
     agents = [Agent(envs).to(device) for i in range(num_objectives)]
 
     low_level_checkpoint_path = args.low_level_checkpoint_path
@@ -224,13 +232,20 @@ if __name__ == "__main__":
     actions_h = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long).to(device)
     logprobs_h = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards_h = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    if use_weights:
+        weights_h = torch.zeros((args.num_steps, args.num_envs, num_objectives)).to(device)
     values_h = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones_h = torch.zeros((args.num_steps, args.num_envs)).to(device)
-
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
     obs, _ = envs.reset(seed=args.seed)
+    # Generate one weight per environment, fixed for that episode
+    if use_weights:
+        current_weights = torch.tensor(
+            np.random.dirichlet(np.ones(num_objectives), size=args.num_envs),
+            dtype=torch.float32,
+        ).to(device)
     next_obs = torch.Tensor(obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
 
@@ -265,7 +280,7 @@ if __name__ == "__main__":
             with torch.no_grad():
                 # flatten obs for network if needed (controller expects flat vector)
                 flat_obs = next_obs.view(args.num_envs, -1)
-                hl_action, hl_logprob, hl_entropy, hl_value = controller.get_action_and_value(flat_obs)
+                hl_action, hl_logprob, hl_entropy, hl_value = controller.get_action_and_value(flat_obs, current_weights) if use_weights else controller.get_action_and_value(flat_obs)
                 # hl_action: tensor shape (num_envs,), values in {0..num_objectives-1}
                 high_actions = hl_action.detach()
                 logprobs_h[step] = hl_logprob.detach()
@@ -280,6 +295,15 @@ if __name__ == "__main__":
             for i, env_action in enumerate(high_actions):
                 writer.add_scalar(f"charts/chosen_obj_env{i}", env_action, global_step)   
 
+            if use_weights:
+                finished_envs = (next_done > 0).nonzero(as_tuple=True)[0]
+                if len(finished_envs) > 0:
+                    new_weights = torch.tensor(
+                        np.random.dirichlet(np.ones(num_objectives), size=len(finished_envs)),
+                        dtype=torch.float32
+                    ).to(device)
+                    current_weights[finished_envs] = new_weights
+                
             for k in range(args.obj_duration): #each env is seperate
                 # For each distinct selected objective, compute actions for envs that chose it
                 # Build actions array for all envs
@@ -299,7 +323,7 @@ if __name__ == "__main__":
                 next_obs_np, reward_np, terminations, truncations, infos = envs.step(actions_batch)
                 # reward_np shape is (num_envs, reward_dim)
                 # compute scalarised reward per env
-                scalar_reward = reward_np.sum(axis=1).astype(np.float32)
+                scalar_reward = (reward_np * current_weights.cpu().numpy()).sum(axis=1).astype(np.float32) if use_weights else reward_np.mean(axis=1).astype(np.float32)
                 # accumulate discounted sum within the option
                 cum_reward += (args.gamma ** k) * scalar_reward
                 # update done and obs for the next primitive step
@@ -328,13 +352,11 @@ if __name__ == "__main__":
                 # If all envs are done, break early
                 if finished.all():
                     break
-                
-
-
+            if use_weights:        
+               weights_h[step] = current_weights
             # store high-level reward and done flags for this high-level decision
             rewards_h[step] = torch.tensor(cum_reward, dtype=torch.float32).to(device)
             dones_h[step] = next_done
-
             # store high-level action
             actions_h[step] = high_actions.long()
             #for i in range(len(cum_reward)):
@@ -346,7 +368,7 @@ if __name__ == "__main__":
         advantages = torch.zeros_like(rewards_h).to(device)
         returns = torch.zeros_like(rewards_h).to(device)
         with torch.no_grad():
-            next_value = controller.get_value(next_obs.view(args.num_envs, -1)).reshape(1, -1)  # shape (1, num_envs)
+            next_value = controller.get_value(next_obs.view(args.num_envs, -1),current_weights).reshape(1, -1) if use_weights else controller.get_value(next_obs.view(args.num_envs, -1)).reshape(1, -1)  # shape (1, num_envs) # shape (1, num_envs)
 
         lastgaelam = torch.zeros(args.num_envs).to(device)
         for t in reversed(range(args.num_steps)):
@@ -381,10 +403,13 @@ if __name__ == "__main__":
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
-
-                _, newlogprob, entropy, newvalue = controller.get_action_and_value(
-                    obs[mb_inds].view(len(mb_inds), -1), actions.long()[mb_inds]
-                )
+                if use_weights:
+                    weights_flat = weights_h.reshape(-1, num_objectives)
+                    _, newlogprob, entropy, newvalue = controller.get_action_and_value(
+                        obs[mb_inds].view(len(mb_inds), -1), weights_flat[mb_inds], actions.long()[mb_inds]
+                    )
+                else:
+                     obs[mb_inds].view(len(mb_inds), -1), actions.long()[mb_inds]
                 logratio = newlogprob - logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -433,6 +458,10 @@ if __name__ == "__main__":
         writer.add_scalar(
             "charts/SPS", int(global_step / (time.time() - start_time)), global_step
         )
+        if use_weights:
+            mean_w = current_weights.mean(0).cpu().numpy()
+            for i, val in enumerate(mean_w):
+                writer.add_scalar(f"weights/mean_obj{i}", val, global_step)
 
         if iteration % args.checkpoint_interval == 0:
             checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_{iteration}.pt")
