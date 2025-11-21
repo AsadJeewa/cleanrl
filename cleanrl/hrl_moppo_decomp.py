@@ -18,6 +18,7 @@ from mo_gymnasium.wrappers import MORecordEpisodeStatistics, SingleRewardWrapper
 from gymnasium.wrappers import TimeLimit
 from mo_gymnasium.wrappers.vector import MOSyncVectorEnv
 from cleanrl.moppo_decomp import Agent
+from mo_gymnasium.envs.shapes_grid.shapes_grid import DIFFICULTY
 
 @dataclass
 class Args:
@@ -43,6 +44,8 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "shapes-grid-v0"
     """the id of the environment"""
+    env_diff: str = "toy"
+    """difficulty of the environment ONLY SUPPORTED BY shapes-grid (toy, easy or hard)"""
     total_timesteps: int = 1e7#1e5
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
@@ -90,15 +93,17 @@ class Args:
     """the relative checkpoint pt to load checkpoint from"""
     run_name_mod: str = ""  
     """run name modifier"""
-    low_level_checkpoint_path: str = "../model/shapes-grid/toy2_long__shapes-grid-v0__moppo_decomp__1__1763475033/checkpoint_1010.pt"  
+    low_level_checkpoint_path: str = "../model/shapes-grid/toy2_long__shapes-grid-v0__moppo_decomp__1__1763475033/checkpoint_1010.pt"
     """checkpoint path for pre-trained low-level policies"""
 
-    obj_duration: int = 2#5
+    obj_duration: int = 2 # 5
     """how many primitive steps the chosen low-level policy runs for each high-level decision"""
-    use_weights: bool = True
-    """Toggles whether or not to uscondition the ocntroller on weights."""
+    input_cont_weights: bool = False
+    """Toggles whether or not to condition the controller on weights. This removes automation"""
+    output_cont_weights: bool = False
+    """Toggles whether or not the controller outputs weights."""
     
-def make_env(env_id, idx, capture_video, run_name):
+def make_env(env_id, idx, capture_video, run_name, difficulty=""):
     def thunk():
         # if capture_video and idx == 0:
         #     env = gym.make(env_id, render_mode="rgb_array")
@@ -106,7 +111,10 @@ def make_env(env_id, idx, capture_video, run_name):
         # else:
         #     env = gym.make(env_id)
         # env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = mo_gym.make(env_id)
+        extra_kwargs = {}
+        if difficulty:
+            extra_kwargs["difficulty"] = DIFFICULTY[difficulty.upper()]
+        env = mo_gym.make(env_id, **extra_kwargs)
         # env = mo_gym.wrappers.LinearReward(env, weight=np.array([0.8, 0.2]))
         # env = TimeLimit(env, max_episode_steps=100)  # ensure episodes end
         env = MORecordEpisodeStatistics(env, gamma=0.98)
@@ -123,11 +131,16 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
     
 class Controller(nn.Module):
-    def __init__(self, envs, use_weights=False):
+    input_cont_weights: bool = False
+    output_cont_weights: bool = False
+    
+    def __init__(self, envs, input_cont_weights=False, output_cont_weights=False):
         super().__init__()
+        self.input_cont_weights = input_cont_weights
+        self.output_cont_weights = output_cont_weights
         obs_dim = envs.single_observation_space.shape
         reward_dim = envs.envs[0].reward_dim
-        input_dim = int(np.prod(obs_dim)) + reward_dim if use_weights else obs_dim
+        input_dim = int(np.prod(obs_dim)) + reward_dim if input_cont_weights else obs_dim
         self.critic = nn.Sequential(
             layer_init(
                 nn.Linear(np.array(input_dim).prod(), 64)
@@ -153,12 +166,20 @@ class Controller(nn.Module):
 
     def get_action_and_value(self, obs, w=None, action=None):
         x = torch.cat([obs, w], dim=1) if w is not None else obs
-        logits = self.actor(x)
-        probs = Categorical(logits=logits)
-        if action is None:
-            action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(x)
-
+          
+        if self.output_cont_weights:
+            log_alpha = self.actor(x)
+            alpha = torch.nn.functional.softplus(log_alpha) + 1e-3
+            dist = torch.distributions.Dirichlet(alpha)
+            if action is None:
+                action = dist.sample()
+            return action, dist.log_prob(action), dist.entropy(), self.critic(x) 
+        else:
+            logits = self.actor(x)
+            probs = Categorical(logits=logits)
+            if action is None:
+                action = probs.sample()
+            return action, probs.log_prob(action), probs.entropy(), self.critic(x)    
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -167,8 +188,9 @@ if __name__ == "__main__":
     run_name = f"{args.run_name_mod}__{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     checkpoint_dir = f"checkpoints/{run_name}"
     os.makedirs(checkpoint_dir, exist_ok=True)
-    use_weights = args.use_weights
-    
+    input_cont_weights = args.input_cont_weights
+    output_cont_weights = args.output_cont_weights
+    assert not (args.input_cont_weights and args.output_cont_weights), "input_cont_weights and output_cont_weights cannot both be True."
     if args.track:
         import wandb
         if args.offline:
@@ -199,13 +221,13 @@ if __name__ == "__main__":
 
     # env setup
     envs = MOSyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
+        [make_env(args.env_id, i, args.capture_video, run_name, difficulty=args.env_diff) for i in range(args.num_envs)],
     )
 
     num_objectives = get_base_env(envs.envs[0]).reward_dim
 
     base_env = get_base_env(envs.envs[0])
-    controller = Controller(envs, use_weights).to(device)
+    controller = Controller(envs, input_cont_weights, output_cont_weights).to(device)
     agents = [Agent(envs).to(device) for i in range(num_objectives)]
 
     low_level_checkpoint_path = args.low_level_checkpoint_path
@@ -232,7 +254,7 @@ if __name__ == "__main__":
     actions_h = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long).to(device)
     logprobs_h = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards_h = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    if use_weights:
+    if input_cont_weights or output_cont_weights:
         weights_h = torch.zeros((args.num_steps, args.num_envs, num_objectives)).to(device)
     values_h = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones_h = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -241,7 +263,7 @@ if __name__ == "__main__":
     start_time = time.time()
     obs, _ = envs.reset(seed=args.seed)
     # Generate one weight per environment, fixed for that episode
-    if use_weights:
+    if input_cont_weights:
         current_weights = torch.tensor(
             np.random.dirichlet(np.ones(num_objectives), size=args.num_envs),
             dtype=torch.float32,
@@ -280,11 +302,28 @@ if __name__ == "__main__":
             with torch.no_grad():
                 # flatten obs for network if needed (controller expects flat vector)
                 flat_obs = next_obs.view(args.num_envs, -1)
-                hl_action, hl_logprob, hl_entropy, hl_value = controller.get_action_and_value(flat_obs, current_weights) if use_weights else controller.get_action_and_value(flat_obs)
-                # hl_action: tensor shape (num_envs,), values in {0..num_objectives-1}
-                high_actions = hl_action.detach()
-                logprobs_h[step] = hl_logprob.detach()
-                values_h[step] = hl_value.detach().view(-1)
+                if args.input_cont_weights:
+                    hl_action, hl_logprob, hl_entropy, hl_value = controller.get_action_and_value(flat_obs, current_weights)
+                else:
+                    hl_action, hl_logprob, hl_entropy, hl_value = controller.get_action_and_value(flat_obs)
+
+                # If controller returned continuous weights (Dirichlet), hl_action is (num_envs, num_objectives)
+                if args.output_cont_weights:
+                    hl_weights = hl_action  # shape (num_envs, num_objectives)
+                    # derive a discrete policy index per env from the sampled weights:
+                    # Option 1: argmax (deterministic selection from this sample)
+                    # high_actions = torch.argmax(hl_weights, dim=1)
+                    # Option 2: sample categorical according to hl_weights (stochastic)
+                    high_actions = torch.distributions.Categorical(probs=hl_weights).sample()  # shape (num_envs,)
+                    # store weights and scalar logprob from Dirichlet
+                    weights_h[step] = hl_weights.cpu()
+                    logprobs_h[step] = hl_logprob.detach()
+                    values_h[step] = hl_value.detach().view(-1)
+                else:
+                    # discrete controller
+                    high_actions = hl_action.detach()
+                    logprobs_h[step] = hl_logprob.detach()
+                    values_h[step] = hl_value.detach().view(-1)
 
             # We'll run the chosen low-level policy for obj_duration primitive steps.
             # For each primitive step we must produce a full action vector for the vector env.
@@ -295,7 +334,7 @@ if __name__ == "__main__":
             for i, env_action in enumerate(high_actions):
                 writer.add_scalar(f"charts/chosen_obj_env{i}", env_action, global_step)   
 
-            if use_weights:
+            if input_cont_weights:
                 finished_envs = (next_done > 0).nonzero(as_tuple=True)[0]
                 if len(finished_envs) > 0:
                     new_weights = torch.tensor(
@@ -323,7 +362,7 @@ if __name__ == "__main__":
                 next_obs_np, reward_np, terminations, truncations, infos = envs.step(actions_batch)
                 # reward_np shape is (num_envs, reward_dim)
                 # compute scalarised reward per env
-                scalar_reward = (reward_np * current_weights.cpu().numpy()).sum(axis=1).astype(np.float32) if use_weights else reward_np.mean(axis=1).astype(np.float32)
+                scalar_reward = (reward_np * current_weights.cpu().numpy()).sum(axis=1).astype(np.float32) if input_cont_weights else reward_np.mean(axis=1).astype(np.float32)
                 # accumulate discounted sum within the option
                 cum_reward += (args.gamma ** k) * scalar_reward
                 # update done and obs for the next primitive step
@@ -352,7 +391,7 @@ if __name__ == "__main__":
                 # If all envs are done, break early
                 if finished.all():
                     break
-            if use_weights:        
+            if input_cont_weights:        
                weights_h[step] = current_weights
             # store high-level reward and done flags for this high-level decision
             rewards_h[step] = torch.tensor(cum_reward, dtype=torch.float32).to(device)
@@ -368,7 +407,7 @@ if __name__ == "__main__":
         advantages = torch.zeros_like(rewards_h).to(device)
         returns = torch.zeros_like(rewards_h).to(device)
         with torch.no_grad():
-            next_value = controller.get_value(next_obs.view(args.num_envs, -1),current_weights).reshape(1, -1) if use_weights else controller.get_value(next_obs.view(args.num_envs, -1)).reshape(1, -1)  # shape (1, num_envs) # shape (1, num_envs)
+            next_value = controller.get_value(next_obs.view(args.num_envs, -1),current_weights).reshape(1, -1) if input_cont_weights else controller.get_value(next_obs.view(args.num_envs, -1)).reshape(1, -1)  # shape (1, num_envs) # shape (1, num_envs)
 
         lastgaelam = torch.zeros(args.num_envs).to(device)
         for t in reversed(range(args.num_steps)):
@@ -403,13 +442,28 @@ if __name__ == "__main__":
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
-                if use_weights:
-                    weights_flat = weights_h.reshape(-1, num_objectives)
+                # Flatten obs batch
+                obs_batch = obs[mb_inds].view(len(mb_inds), -1)
+                # Case 1: Controller outputs continuous weight vectors
+                if args.output_cont_weights:
+                    action_vectors = weights_h.reshape(-1, num_objectives)[mb_inds].to(device)
                     _, newlogprob, entropy, newvalue = controller.get_action_and_value(
-                        obs[mb_inds].view(len(mb_inds), -1), weights_flat[mb_inds], actions.long()[mb_inds]
+                        obs_batch,
+                        action=action_vectors
                     )
+                # Case 2: Controller outputs discrete actions (Categorical case)
                 else:
-                     obs[mb_inds].view(len(mb_inds), -1), actions.long()[mb_inds]
+                    # Stored discrete action indices
+                    action_indices = actions.long()[mb_inds].to(device)
+                    # Optional input-conditioning weights (only allowed in THIS mode)
+                    w_batch = None
+                    if args.input_cont_weights:
+                        w_batch = weights_h.reshape(-1, num_objectives)[mb_inds].to(device)
+                    _, newlogprob, entropy, newvalue = controller.get_action_and_value(
+                        obs_batch,
+                        w=w_batch,
+                        action=action_indices
+                    )
                 logratio = newlogprob - logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -458,7 +512,7 @@ if __name__ == "__main__":
         writer.add_scalar(
             "charts/SPS", int(global_step / (time.time() - start_time)), global_step
         )
-        if use_weights:
+        if input_cont_weights:
             mean_w = current_weights.mean(0).cpu().numpy()
             for i, val in enumerate(mean_w):
                 writer.add_scalar(f"weights/mean_obj{i}", val, global_step)
