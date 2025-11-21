@@ -16,7 +16,7 @@ import mo_gymnasium as mo_gym
 from mo_gymnasium.wrappers import MORecordEpisodeStatistics, SingleRewardWrapper
 from gymnasium.wrappers import TimeLimit
 from cleanrl_utils.utils import get_base_env
-
+from mo_gymnasium.envs.shapes_grid.shapes_grid import DIFFICULTY
 
 @dataclass
 class Args:
@@ -42,6 +42,9 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "shapes-grid-v0"
     """the id of the environment"""
+    env_diff: str = "toy"
+    """difficulty of the environment ONLY SUPPORTED BY shapes-grid (toy, easy or hard)"""
+       
     total_timesteps: int = 5e6  # 1e5
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
@@ -74,7 +77,6 @@ class Args:
     """the maximum norm for the gradient clipping"""
     target_kl: float = None
     """the target KL divergence threshold"""
-
     # to be filled in runtime
     batch_size: int = 0
     """the batch size (computed in runtime)"""
@@ -90,7 +92,7 @@ class Args:
     run_name_mod: str = ""
     """run name modifier"""
 
-def make_env(env_id, obj_idx, capture_video, run_name):
+def make_env(env_id, obj_idx, capture_video, run_name, difficulty=""):
     def thunk():
         # if capture_video and idx == 0:
         #     env = gym.make(env_id, render_mode="rgb_array")
@@ -98,7 +100,10 @@ def make_env(env_id, obj_idx, capture_video, run_name):
         # else:
         #     env = gym.make(env_id)
         # env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = mo_gym.make(env_id)
+        extra_kwargs = {}
+        if difficulty:
+            extra_kwargs["difficulty"] = DIFFICULTY[difficulty.upper()]
+        env = mo_gym.make(env_id, **extra_kwargs)
         # env = mo_gym.wrappers.LinearReward(env, weight=np.array([0.8, 0.2]))
         # env = TimeLimit(env, max_episode_steps=100)  # ensure episodes end
         env = MORecordEpisodeStatistics(env, gamma=0.98)
@@ -190,12 +195,11 @@ if __name__ == "__main__":
     temp_env = MORecordEpisodeStatistics(temp_env, gamma=0.98)
     num_objectives = temp_env.reward_dim
     temp_env.close()
-
     # env setup
     envs_list = [
         gym.vector.SyncVectorEnv(
             [
-                make_env(args.env_id, obj_idx, args.capture_video, run_name)
+                make_env(args.env_id, obj_idx, args.capture_video, run_name, difficulty=args.env_diff)
                 for _ in range(args.num_envs)
             ]
         )
