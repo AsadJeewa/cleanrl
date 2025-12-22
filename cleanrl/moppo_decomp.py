@@ -13,10 +13,10 @@ import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 import mo_gymnasium as mo_gym
-from mo_gymnasium.wrappers import MORecordEpisodeStatistics, SingleRewardWrapper
+from mo_gymnasium.wrappers import MORecordEpisodeStatistics
 from gymnasium.wrappers import TimeLimit
 from cleanrl_utils.utils import get_base_env
-from mo_gymnasium.envs.shapes_grid.shapes_grid import DIFFICULTY
+from cleanrl.networks import CNNTorso
 
 @dataclass
 class Args:
@@ -92,65 +92,39 @@ class Args:
     run_name_mod: str = ""
     """run name modifier"""
 
-def make_env(env_id, obj_idx, capture_video, run_name, difficulty=""):
-    def thunk():
-        # if capture_video and idx == 0:
-        #     env = gym.make(env_id, render_mode="rgb_array")
-        #     env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        # else:
-        #     env = gym.make(env_id)
-        # env = gym.wrappers.RecordEpisodeStatistics(env)
-        extra_kwargs = {}
-        if difficulty:
-            extra_kwargs["difficulty"] = DIFFICULTY[difficulty.upper()]
-        env = mo_gym.make(env_id, **extra_kwargs)
-        # env = mo_gym.wrappers.LinearReward(env, weight=np.array([0.8, 0.2]))
-        # env = TimeLimit(env, max_episode_steps=100)  # ensure episodes end
-        env = MORecordEpisodeStatistics(env, gamma=0.98)
-        env = SingleRewardWrapper(env, obj_idx)
-
-        return env
-
-    return thunk
-
-
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
-
-
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
-        self.critic = nn.Sequential(
-            layer_init(
-                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)
-            ),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
-        )
+        obs_dim = envs.single_observation_space.shape
+        self.torso = CNNTorso((obs_dim), output_dim=128)
         self.actor = nn.Sequential(
-            layer_init(
-                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)
-            ),
+            nn.Linear(128, 64),  # concat weights if needed
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
+            nn.Linear(64, envs.single_action_space.n)
         )
+        self.critic = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.Tanh(),
+            nn.Linear(64, 1)
+        )
+        
+    def forward_torso(self, x):
+        if len(x.shape) == 3:  # (N, H, W)
+            x = x.unsqueeze(1)  # add channel dimension
+        return self.torso(x)
 
     def get_value(self, x):
-        return self.critic(x)
+        x_feat = self.forward_torso(x)
+        return self.critic(x_feat).squeeze(-1)
+
 
     def get_action_and_value(self, x, action=None):
-        logits = self.actor(x)
+        x_feat = self.forward_torso(x)
+        logits = self.actor(x_feat)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(x)
+        return action, probs.log_prob(action), probs.entropy(), self.critic(x_feat).squeeze(-1)
 
 
 if __name__ == "__main__":
@@ -199,7 +173,7 @@ if __name__ == "__main__":
     envs_list = [
         gym.vector.SyncVectorEnv(
             [
-                make_env(args.env_id, obj_idx, args.capture_video, run_name, difficulty=args.env_diff)
+                make_env(args.env_id, obj_idx, args.capture_video, run_name, single_reward=True, difficulty=args.env_diff)
                 for _ in range(args.num_envs)
             ]
         )
@@ -255,18 +229,10 @@ if __name__ == "__main__":
     for obj_idx, vec_env in enumerate(envs_list):
         # reset vectorised env
         obs, _ = vec_env.reset(seed=args.seed)
-
-        # get specialised obs for each underlying env
-        spec_obs_list = []
         for env in vec_env.envs:
             base_env = get_base_env(env)
-            spec_obs = base_env.update_specialisation(obj_idx + 1)  # returns masked obs
-            spec_obs = spec_obs.squeeze(0)  # now [obs_dim]
-            spec_obs_list.append(spec_obs)
-
-        # Stack all envs into a single batch tensor
-        spec_obs_batch = np.concatenate(spec_obs_list, axis=0)  # merges along first dim
-        next_obs_list.append(torch.Tensor(spec_obs_batch).to(device))
+            base_env.set_specialisation(obj_idx + 1)
+        next_obs_list.append(torch.Tensor(obs).to(device))
         next_done_list.append(
             torch.zeros(args.num_envs, dtype=torch.float32).to(device)
         )
@@ -316,7 +282,7 @@ if __name__ == "__main__":
                 dones_list[i][step] = next_done
 
                 with torch.no_grad():
-                    action, logprob, _, value = agent.get_action_and_value(next_obs)
+                    action, logprob, _, value = agent.get_action_and_value(next_obs.float())
                     values_list[i][step] = value.flatten()
 
                 actions_list[i][step] = action
@@ -380,7 +346,7 @@ if __name__ == "__main__":
         returns_list = []
         with torch.no_grad():
             next_values_list = [
-                agents[i].get_value(next_obs_list[i]).reshape(1, -1)
+                agents[i].get_value(next_obs_list[i])
                 for i in range(num_objectives)
             ]
 
