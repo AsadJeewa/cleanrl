@@ -12,12 +12,12 @@ import torch.optim as optim
 import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
-from cleanrl_utils import get_base_env
+from cleanrl_utils import get_base_env, layer_init, make_env
 import mo_gymnasium as mo_gym
-from mo_gymnasium.wrappers import MORecordEpisodeStatistics, SingleRewardWrapper
 from gymnasium.wrappers import TimeLimit
 from mo_gymnasium.wrappers.vector import MOSyncVectorEnv
 from cleanrl.moppo_decomp import Agent
+from cleanrl.networks import CNNTorso
 
 @dataclass
 class Args:
@@ -43,6 +43,8 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "shapes-grid-v0"
     """the id of the environment"""
+    env_diff: str = "toy"
+    """difficulty of the environment ONLY SUPPORTED BY shapes-grid (toy, easy or hard)"""
     total_timesteps: int = 1e7#1e5
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
@@ -90,35 +92,10 @@ class Args:
     """the relative checkpoint pt to load checkpoint from"""
     run_name_mod: str = ""  
     """run name modifier"""
-    low_level_checkpoint_path: str = "..//model/shapes-grid/toy_2_penalty__shapes-grid-v0__moppo_decomp__1__1763473551/checkpoint_280.pt"  
+    low_level_checkpoint_path: str = "../model/shapes-grid/SAVE/cnn_low_level_easy__shapes-grid-v0__moppo_decomp__1__1766138143/checkpoint_410.pt"  
     """checkpoint path for pre-trained low-level policies"""
-
     obj_duration: int = 2#5
     """how many primitive steps the chosen low-level policy runs for each high-level decision"""
-    
-def make_env(env_id, idx, capture_video, run_name):
-    def thunk():
-        # if capture_video and idx == 0:
-        #     env = gym.make(env_id, render_mode="rgb_array")
-        #     env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        # else:
-        #     env = gym.make(env_id)
-        # env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = mo_gym.make(env_id)
-        # env = mo_gym.wrappers.LinearReward(env, weight=np.array([0.8, 0.2]))
-        # env = TimeLimit(env, max_episode_steps=100)  # ensure episodes end
-        env = MORecordEpisodeStatistics(env, gamma=0.98)
-        #env = SingleRewardWrapper(env, obj_idx)
-
-        return env
-
-    return thunk
-
-
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
     
 class Controller(nn.Module):
     def __init__(self, envs):
@@ -126,31 +103,33 @@ class Controller(nn.Module):
         obs_dim = envs.single_observation_space.shape
         reward_dim = envs.envs[0].reward_dim
         input_dim = int(np.prod(obs_dim)) + reward_dim
+        self.torso = CNNTorso((obs_dim), output_dim=128)
+        features_dim = self.torso.output_dim    
+        input_dim = features_dim + reward_dim 
         self.critic = nn.Sequential(
-            layer_init(
-                nn.Linear(np.array(input_dim).prod(), 64)
-            ),
+            nn.Linear(input_dim, 64),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
+            nn.Linear(64, 1)
         )
         self.actor = nn.Sequential(
-            layer_init(
-                nn.Linear(np.array(input_dim).prod(), 64)
-            ),
+            nn.Linear(input_dim, 64),  # concat weights if needed
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, reward_dim), std=0.01),#num objectives
+            nn.Linear(64, reward_dim)
         )
+        
+    def forward_torso(self, x):
+        if len(x.shape) == 3:  # (N, H, W)
+            x = x.unsqueeze(1)  # add channel dimension
+        return self.torso(x)
 
     def get_value(self, obs, w):
-        x = torch.cat([obs, w], dim=1)
+        x_feat = self.forward_torso(obs)
+        x = torch.cat([x_feat, w], dim=1)
         return self.critic(x)
 
     def get_action_and_value(self, obs, w, action=None):
-        x = torch.cat([obs, w], dim=1)
+        x_feat = self.forward_torso(obs)
+        x = torch.cat([x_feat, w], dim=1)
         logits = self.actor(x)
         probs = Categorical(logits=logits)
         if action is None:
@@ -196,7 +175,7 @@ if __name__ == "__main__":
 
     # env setup
     envs = MOSyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
+        [make_env(args.env_id, i, args.capture_video, run_name, difficulty=args.env_diff) for i in range(args.num_envs)],
     )
 
     num_objectives = get_base_env(envs.envs[0]).reward_dim
@@ -275,8 +254,7 @@ if __name__ == "__main__":
 
             with torch.no_grad():
                 # flatten obs for network if needed (controller expects flat vector)
-                flat_obs = next_obs.view(args.num_envs, -1)
-                hl_action, hl_logprob, hl_entropy, hl_value = controller.get_action_and_value(flat_obs, current_weights)
+                hl_action, hl_logprob, hl_entropy, hl_value = controller.get_action_and_value(next_obs, current_weights)
                 # hl_action: tensor shape (num_envs,), values in {0..num_objectives-1}
                 high_actions = hl_action.detach()
                 logprobs_h[step] = hl_logprob.detach()
@@ -304,16 +282,15 @@ if __name__ == "__main__":
                 # Build actions array for all envs
                 actions_batch = np.zeros((args.num_envs,), dtype=np.int64)
                 for opt_idx in range(num_objectives):
-                    mask = np.where(high_actions_np == opt_idx)[0]
-                    if mask.size == 0:
+                    env_mask = np.where(high_actions_np == opt_idx)[0]
+                    if env_mask.size == 0:
                         continue
                     # gather obs for these env indices
-                    obs_group = next_obs[mask]  # shape (n_mask, *obs_shape)
-                    flat_obs_group = obs_group.view(len(mask), -1)
+                    obs_group = next_obs[env_mask]  # shape (n_mask, *obs_shape)
                     with torch.no_grad():
                         # low-level agent returns an action per sample in the group
-                        action_group, _, _, _ = agents[opt_idx].get_action_and_value(flat_obs_group) #take action with chosen policy
-                    actions_batch[mask] = action_group.cpu().numpy().astype(np.int64)
+                        action_group, _, _, _ = agents[opt_idx].get_action_and_value(obs_group) #take action with chosen policy
+                    actions_batch[env_mask] = action_group.cpu().numpy().astype(np.int64)
                 # step the vector env with the assembled actions
                 next_obs_np, reward_np, terminations, truncations, infos = envs.step(actions_batch)
                 # reward_np shape is (num_envs, reward_dim)
@@ -363,7 +340,7 @@ if __name__ == "__main__":
         advantages = torch.zeros_like(rewards_h).to(device)
         returns = torch.zeros_like(rewards_h).to(device)
         with torch.no_grad():
-            next_value = controller.get_value(next_obs.view(args.num_envs, -1),current_weights).reshape(1, -1)  # shape (1, num_envs)
+            next_value = controller.get_value(next_obs,current_weights)
 
         lastgaelam = torch.zeros(args.num_envs).to(device)
         for t in reversed(range(args.num_steps)):
@@ -400,7 +377,7 @@ if __name__ == "__main__":
                 mb_inds = b_inds[start:end]
                 weights_flat = weights_h.reshape(-1, num_objectives)
                 _, newlogprob, entropy, newvalue = controller.get_action_and_value(
-                    obs[mb_inds].view(len(mb_inds), -1), weights_flat[mb_inds], actions.long()[mb_inds]
+                    obs[mb_inds], weights_flat[mb_inds], actions.long()[mb_inds]
                 )
                 logratio = newlogprob - logprobs[mb_inds]
                 ratio = logratio.exp()
