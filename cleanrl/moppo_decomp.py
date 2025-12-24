@@ -15,8 +15,8 @@ from torch.utils.tensorboard import SummaryWriter
 import mo_gymnasium as mo_gym
 from mo_gymnasium.wrappers import MORecordEpisodeStatistics
 from gymnasium.wrappers import TimeLimit
-from cleanrl_utils.utils import get_base_env
 from cleanrl.networks import CNNTorso
+from cleanrl_utils import get_base_env, layer_init, make_env
 
 @dataclass
 class Args:
@@ -173,7 +173,7 @@ if __name__ == "__main__":
     envs_list = [
         gym.vector.SyncVectorEnv(
             [
-                make_env(args.env_id, obj_idx, args.capture_video, run_name, single_reward=True, difficulty=args.env_diff)
+                make_env(args.env_id, obj_idx, difficulty=args.env_diff, capture_video=args.capture_video, run_name=run_name)
                 for _ in range(args.num_envs)
             ]
         )
@@ -229,10 +229,13 @@ if __name__ == "__main__":
     for obj_idx, vec_env in enumerate(envs_list):
         # reset vectorised env
         obs, _ = vec_env.reset(seed=args.seed)
+        # get specialised obs for each underlying env
+        spec_obs_list = []
         for env in vec_env.envs:
             base_env = get_base_env(env)
-            base_env.set_specialisation(obj_idx + 1)
-        next_obs_list.append(torch.Tensor(obs).to(device))
+            spec_obs = base_env.set_specialisation(obj_idx + 1)  # returns masked obs
+            spec_obs_list.append(spec_obs)
+        next_obs_list.append(torch.Tensor(spec_obs_list).to(device))
         next_done_list.append(
             torch.zeros(args.num_envs, dtype=torch.float32).to(device)
         )
