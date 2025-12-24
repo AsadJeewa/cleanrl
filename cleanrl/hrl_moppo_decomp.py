@@ -86,7 +86,7 @@ class Args:
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
 
-    checkpoint_interval: int = 100
+    checkpoint_interval: int = 10
     """the checkpoint interval in iterations"""
     resume_from: str = ""  
     """the relative checkpoint pt to load checkpoint from"""
@@ -97,15 +97,15 @@ class Args:
 
     obj_duration: int = 2 # 5
     """how many primitive steps the chosen low-level policy runs for each high-level decision"""
-    output_cont_weights: bool = False
+    output_weights: bool = False
     """Toggles whether or not the controller outputs weights."""
     
 class Controller(nn.Module):
-    output_cont_weights: bool = False
+    output_weights: bool = False
     
-    def __init__(self, envs, output_cont_weights=False):
+    def __init__(self, envs, output_weights=False):
         super().__init__()
-        self.output_cont_weights = output_cont_weights
+        self.output_weights = output_weights
         obs_dim = envs.single_observation_space.shape
         self.torso = CNNTorso((obs_dim), output_dim=128)
         reward_dim = envs.envs[0].reward_dim
@@ -136,7 +136,7 @@ class Controller(nn.Module):
         x_feat = self.forward_torso(obs)
         x = torch.cat([x_feat, w], dim=1) if w is not None else x_feat
           
-        if self.output_cont_weights:
+        if self.output_weights:
             log_alpha = self.actor(x)
             alpha = torch.nn.functional.softplus(log_alpha) + 1e-3
             dist = torch.distributions.Dirichlet(alpha)
@@ -158,7 +158,7 @@ if __name__ == "__main__":
     run_name = f"{args.run_name_mod}__{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     checkpoint_dir = f"checkpoints/{run_name}"
     os.makedirs(checkpoint_dir, exist_ok=True)
-    output_cont_weights = args.output_cont_weights
+    output_weights = args.output_weights
     if args.track:
         import wandb
         if args.offline:
@@ -189,13 +189,13 @@ if __name__ == "__main__":
 
     # env setup
     envs = MOSyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name, difficulty=args.env_diff) for i in range(args.num_envs)],
+        [make_env(args.env_id, difficulty=args.env_diff, capture_video=args.capture_video, run_name=run_name) for i in range(args.num_envs)],
     )
-
+    
     num_objectives = get_base_env(envs.envs[0]).reward_dim
 
     base_env = get_base_env(envs.envs[0])
-    controller = Controller(envs, output_cont_weights).to(device)
+    controller = Controller(envs, output_weights).to(device)
     agents = [Agent(envs).to(device) for i in range(num_objectives)]
 
     low_level_checkpoint_path = args.low_level_checkpoint_path
@@ -222,7 +222,7 @@ if __name__ == "__main__":
     actions_h = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long).to(device)
     logprobs_h = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards_h = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    if output_cont_weights:
+    if output_weights:
         weights_h = torch.zeros((args.num_steps, args.num_envs, num_objectives)).to(device)
     values_h = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones_h = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -245,6 +245,7 @@ if __name__ == "__main__":
 
     for iteration in range(start_iteration, int(args.num_iterations) + 1): #So each iteration is a full cycle of data collection + training.
         # Annealing the rate if instructed to do so.
+        
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
@@ -265,7 +266,7 @@ if __name__ == "__main__":
                 hl_action, hl_logprob, hl_entropy, hl_value = controller.get_action_and_value(next_obs)
 
                 # If controller returned continuous weights (Dirichlet), hl_action is (num_envs, num_objectives)
-                if args.output_cont_weights:
+                if args.output_weights:
                     hl_weights = hl_action  # shape (num_envs, num_objectives)
                     # derive a discrete policy index per env from the sampled weights:
                     # Option 1: argmax (deterministic selection from this sample)
@@ -290,7 +291,9 @@ if __name__ == "__main__":
             high_actions_np = high_actions.cpu().numpy()
             for i, env_action in enumerate(high_actions):
                 writer.add_scalar(f"charts/chosen_obj_env{i}", env_action, global_step)   
-                
+            
+            # spec_obs = envs.set_specialisation(hl_action.item()+1)
+            #TODO check obs specialisation correct?
             for k in range(args.obj_duration): #each env is seperate
                 # For each distinct selected objective, compute actions for envs that chose it
                 # Build actions array for all envs
@@ -305,6 +308,7 @@ if __name__ == "__main__":
                         # low-level agent returns an action per sample in the group
                         action_group, _, _, _ = agents[opt_idx].get_action_and_value(obs_group) #take action with chosen policy
                     actions_batch[env_mask] = action_group.cpu().numpy().astype(np.int64)
+                
                 # step the vector env with the assembled actions
                 next_obs_np, reward_np, terminations, truncations, infos = envs.step(actions_batch)
                 # reward_np shape is (num_envs, reward_dim)
@@ -388,7 +392,7 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
                 # Case 1: Controller outputs continuous weight vectors
-                if args.output_cont_weights:
+                if args.output_weights:
                     action_output = weights_h.reshape(-1, num_objectives)[mb_inds].to(device)
                 # Case 2: Controller outputs discrete actions (Categorical case)
                 else:

@@ -86,7 +86,7 @@ class Args:
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
 
-    checkpoint_interval: int = 100
+    checkpoint_interval: int = 10
     """the checkpoint interval in iterations"""
     resume_from: str = ""  
     """the relative checkpoint pt to load checkpoint from"""
@@ -175,7 +175,7 @@ if __name__ == "__main__":
 
     # env setup
     envs = MOSyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name, difficulty=args.env_diff) for i in range(args.num_envs)],
+        [make_env(args.env_id, difficulty=args.env_diff, capture_video=args.capture_video, run_name=run_name) for i in range(args.num_envs)],
     )
 
     num_objectives = get_base_env(envs.envs[0]).reward_dim
