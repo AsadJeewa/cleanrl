@@ -109,8 +109,6 @@ class Agent(nn.Module):
         )
         
     def forward_torso(self, x):
-        if len(x.shape) == 3:  # (N, H, W)
-            x = x.unsqueeze(1)  # add channel dimension
         return self.torso(x)
 
     def get_value(self, x):
@@ -233,7 +231,8 @@ if __name__ == "__main__":
         spec_obs_list = []
         for env in vec_env.envs:
             base_env = get_base_env(env)
-            spec_obs = base_env.set_specialisation(obj_idx + 1)  # returns masked obs
+            base_env.set_specialisation(obj_idx + 1)  # returns masked obs
+            spec_obs = base_env.get_specialised_obs()
             spec_obs_list.append(spec_obs)
         next_obs_list.append(torch.Tensor(spec_obs_list).to(device))
         next_done_list.append(
@@ -301,7 +300,14 @@ if __name__ == "__main__":
                 next_done_list[i] = torch.tensor(
                     np.logical_or(terminations, truncations)
                 ).to(device)
-                next_obs_list[i] = torch.Tensor(next_obs_batch).to(device)
+
+                spec_obs_list = []
+                for j, env in enumerate(envs.envs):
+                    base_env = get_base_env(env)
+                    spec_obs = base_env.get_specialised_obs()
+                    spec_obs_list.append(spec_obs)
+
+                next_obs_list[i] = torch.tensor(spec_obs_list, dtype=torch.float32, device=device)
 
                 running_returns[i] += reward_batch
                 running_lengths[i] += 1
