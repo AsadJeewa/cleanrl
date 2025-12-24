@@ -123,8 +123,6 @@ class Controller(nn.Module):
         )
         
     def forward_torso(self, x):
-        if len(x.shape) == 3:  # (N, H, W)
-            x = x.unsqueeze(1)  # add channel dimension
         return self.torso(x)
 
     def get_value(self, obs, w=None):
@@ -298,12 +296,22 @@ if __name__ == "__main__":
                 # For each distinct selected objective, compute actions for envs that chose it
                 # Build actions array for all envs
                 actions_batch = np.zeros((args.num_envs,), dtype=np.int64)
+                
+                spec_next_obs_list = []
+                for j, env in enumerate(envs.envs):
+                    base_env = get_base_env(env)
+                    # specialisation was already set earlier to this agent's objective
+                    spec_obs = base_env.get_specialised_obs()  # no input needed
+                    spec_next_obs_list.append(spec_obs)
+
+                spec_next_obs = torch.tensor(spec_next_obs_list, dtype=torch.float32, device=device)
+                
                 for opt_idx in range(num_objectives):
                     env_mask = np.where(high_actions_np == opt_idx)[0]
                     if env_mask.size == 0:
                         continue
                     # gather obs for these env indices
-                    obs_group = next_obs[env_mask]  # shape (n_mask, *obs_shape)
+                    obs_group = spec_next_obs[env_mask]  # shape (n_mask, *obs_shape)
                     with torch.no_grad():
                         # low-level agent returns an action per sample in the group
                         action_group, _, _, _ = agents[opt_idx].get_action_and_value(obs_group) #take action with chosen policy
