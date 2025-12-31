@@ -92,10 +92,10 @@ class Args:
     """the relative checkpoint pt to load checkpoint from"""
     run_name_mod: str = ""  
     """run name modifier"""
-    low_level_checkpoint_path: str = "../model/shapes-grid/SAVE/cnn_low_level_easy__shapes-grid-v0__moppo_decomp__1__1766138143/checkpoint_410.pt"  
+    low_level_checkpoint_path: str = "../model/shapes-grid/SAVE/cnn_spec_ll_easy__shapes-grid-v0__moppo_decomp__1__1766590803/checkpoint_150.pt"  
     """checkpoint path for pre-trained low-level policies"""
 
-    obj_duration: int = 2 # 5
+    obj_duration: int = 8 #IMP TODO Automate obj_duration = int(min(d_max, avg_distance_between_objects * k) + 1)
     """how many primitive steps the chosen low-level policy runs for each high-level decision"""
     output_weights: bool = False
     """Toggles whether or not the controller outputs weights."""
@@ -283,7 +283,8 @@ if __name__ == "__main__":
 
             # We'll run the chosen low-level policy for obj_duration primitive steps.
             # For each primitive step we must produce a full action vector for the vector env.
-            cum_reward = np.zeros(args.num_envs, dtype=np.float32)  # discounted-sum per env
+            # cum_reward = np.zeros(args.num_envs, dtype=np.float32)  # discounted-sum per env
+            cum_reward = torch.zeros(args.num_envs, dtype=torch.float32, device=device)
 
             # ensure numpy versions for mask indexing
             high_actions_np = high_actions.cpu().numpy()
@@ -291,7 +292,8 @@ if __name__ == "__main__":
                 writer.add_scalar(f"charts/chosen_obj_env{i}", env_action, global_step)   
             
             # spec_obs = envs.set_specialisation(hl_action.item()+1)
-            #TODO check obs specialisation correct?
+            V_s = controller.get_value(next_obs)  # shape [batch_size]
+
             for k in range(args.obj_duration): #each env is seperate
                 # For each distinct selected objective, compute actions for envs that chose it
                 # Build actions array for all envs
@@ -321,7 +323,10 @@ if __name__ == "__main__":
                 next_obs_np, reward_np, terminations, truncations, infos = envs.step(actions_batch)
                 # reward_np shape is (num_envs, reward_dim)
                 # compute scalarised reward per env
-                scalar_reward = reward_np.mean(axis=1).astype(np.float32)
+                if args.output_weights:
+                    scalar_reward = (torch.tensor(reward_np, dtype=torch.float32, device=device) * hl_weights).sum(dim=1)
+                else:
+                    scalar_reward = reward_np.mean(axis=1).astype(np.float32)
                 # accumulate discounted sum within the option
                 cum_reward += (args.gamma ** k) * scalar_reward
                 # update done and obs for the next primitive step
@@ -351,7 +356,10 @@ if __name__ == "__main__":
                 if finished.all():
                     break
             # store high-level reward and done flags for this high-level decision
-            rewards_h[step] = torch.tensor(cum_reward, dtype=torch.float32).to(device)
+            # Optional: normalise advantage for stability
+            advantage = cum_reward - V_s.squeeze()
+            advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+            rewards_h[step] = torch.tensor(advantage, dtype=torch.float32).to(device)
             dones_h[step] = next_done
             # store high-level action
             actions_h[step] = high_actions.long()
