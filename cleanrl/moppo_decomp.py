@@ -30,8 +30,8 @@ class Args:
     """if toggled, cuda will be enabled by default"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    offline: bool = False
-    """if toggled, this experiment will be tracked OFFLINE with Weights and Biases"""    
+    wandb_mode: str = "online"
+    """The mode for Weights & Biases logging: either "online", "offline", or "disabled"."""
     wandb_project_name: str = "cleanRL"
     """the wandb's project name"""
     wandb_entity: str = None
@@ -136,8 +136,6 @@ if __name__ == "__main__":
 
     if args.track:
         import wandb
-        if args.offline:
-            os.environ["WANDB_MODE"] = "offline"
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -146,6 +144,7 @@ if __name__ == "__main__":
             name=run_name,
             monitor_gym=True,
             save_code=True,
+            mode=args.wandb_mode,
         )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
